@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from urllib import error, request
 
+
 class ModerationConfigError(RuntimeError):
     pass
 
@@ -15,6 +16,21 @@ class ModerationRuntimeError(RuntimeError):
 
 class ModerationRejectedError(RuntimeError):
     pass
+
+
+UNSAFE_LABEL_HINTS = (
+    "nsfw",
+    "porn",
+    "porno",
+    "pornography",
+    "explicit",
+    "sexual",
+    "nudity",
+    "nude",
+    "adult",
+    "erotic",
+    "sex",
+)
 
 
 def _parse_bool(value, default=False):
@@ -89,25 +105,108 @@ def _score_from_response(payload):
     return None
 
 
+def _value_is_unsafe_label(value):
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return any(hint in normalized for hint in UNSAFE_LABEL_HINTS)
+
+
+def _score_from_candidate(candidate):
+    if not isinstance(candidate, dict):
+        return None
+
+    score = _score_from_response(candidate)
+    if score is not None:
+        return score
+
+    for key in ("score", "confidence", "probability", "value"):
+        value = candidate.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    return None
+
+
+def _iter_response_candidates(payload):
+    stack = [payload]
+    seen = set()
+
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if isinstance(current, dict):
+            yield current
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+
+
 def _blocked_from_response(payload, threshold):
     if not isinstance(payload, dict):
         return False, None
 
-    explicit_flag = payload.get("blocked")
-    if isinstance(explicit_flag, bool):
-        return explicit_flag, _score_from_response(payload)
+    highest_unsafe_score = None
 
-    flagged = payload.get("flagged")
-    if isinstance(flagged, bool):
-        return flagged, _score_from_response(payload)
+    for candidate in _iter_response_candidates(payload):
+        explicit_flag = candidate.get("blocked")
+        if isinstance(explicit_flag, bool):
+            score = _score_from_candidate(candidate)
+            return explicit_flag, score
 
-    is_safe = payload.get("is_safe")
-    if isinstance(is_safe, bool):
-        return (not is_safe), _score_from_response(payload)
+        flagged = candidate.get("flagged")
+        if isinstance(flagged, bool):
+            score = _score_from_candidate(candidate)
+            return flagged, score
 
-    score = _score_from_response(payload)
-    if score is not None:
-        return score >= threshold, score
+        is_safe = candidate.get("is_safe")
+        if isinstance(is_safe, bool):
+            score = _score_from_candidate(candidate)
+            return (not is_safe), score
+
+        label_keys = ("label", "class", "category", "name")
+        if any(_value_is_unsafe_label(candidate.get(key)) for key in label_keys):
+            score = _score_from_candidate(candidate)
+            if score is None or score >= threshold:
+                return True, score
+            if highest_unsafe_score is None or score > highest_unsafe_score:
+                highest_unsafe_score = score
+
+        categories = candidate.get("categories")
+        if isinstance(categories, dict):
+            for key, value in categories.items():
+                if _value_is_unsafe_label(key) and isinstance(value, (int, float)):
+                    numeric_value = float(value)
+                    if numeric_value >= threshold:
+                        return True, numeric_value
+                    if highest_unsafe_score is None or numeric_value > highest_unsafe_score:
+                        highest_unsafe_score = numeric_value
+
+        predictions = candidate.get("predictions")
+        if isinstance(predictions, list):
+            for item in predictions:
+                if not isinstance(item, dict):
+                    continue
+                if any(_value_is_unsafe_label(item.get(key)) for key in label_keys):
+                    score = _score_from_candidate(item)
+                    if score is None or score >= threshold:
+                        return True, score
+                    if highest_unsafe_score is None or score > highest_unsafe_score:
+                        highest_unsafe_score = score
+
+        score = _score_from_response(candidate)
+        if score is not None and score >= threshold:
+            return True, score
+
+    if highest_unsafe_score is not None:
+        return False, highest_unsafe_score
 
     return False, None
 

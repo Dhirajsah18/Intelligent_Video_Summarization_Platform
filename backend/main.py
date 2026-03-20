@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from utils.extract_audio import extract_audio
 from utils.moderation import (
@@ -12,7 +13,8 @@ from utils.moderation import (
     ModerationRuntimeError,
     run_video_moderation,
 )
-from utils.summarize import generate_time_key_points, summarize_text
+from utils.rag import answer_question_from_transcript, generate_suggested_questions
+from utils.summarize import SUPPORTED_SUMMARY_STYLES, generate_time_key_points, summarize_text
 from utils.transcribe import transcribe_audio
 
 app = FastAPI()
@@ -47,9 +49,25 @@ def _parse_bool(value, default=True):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _ensure_moderation_passed(moderation_result):
+    if not isinstance(moderation_result, dict):
+        raise ModerationRuntimeError("Moderation did not return a valid result.")
+
+    if not moderation_result.get("moderation_passed"):
+        raise ModerationRejectedError(
+            "Uploaded video failed safety moderation. Please upload a different video."
+        )
+
+
 @app.get("/")
 def index():
     return {"message": "AI Video Summarization Backend Running!"}
+
+
+class VideoQuestionRequest(BaseModel):
+    question: str
+    transcript_text: str = ""
+    transcript_segments: list[dict] = []
 
 
 @app.post("/process-video")
@@ -69,6 +87,14 @@ async def process_video(
         raise HTTPException(
             status_code=400,
             detail="Invalid transcription_task. Use 'transcribe' or 'translate'.",
+        )
+
+    normalized_summary_style = (summary_style or "general").strip().lower()
+    if normalized_summary_style not in SUPPORTED_SUMMARY_STYLES:
+        supported_styles = ", ".join(sorted(SUPPORTED_SUMMARY_STYLES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid summary_style. Use one of: {supported_styles}.",
         )
 
     normalized_source_language = (source_language or "auto").strip().lower()
@@ -106,6 +132,7 @@ async def process_video(
             max_frames=os.getenv("CONTENT_MODERATION_MAX_FRAMES", "6"),
             timeout_seconds=os.getenv("CONTENT_MODERATION_TIMEOUT_SECONDS", "20"),
         )
+        _ensure_moderation_passed(moderation_result)
 
         extract_audio(str(video_path), str(audio_path))
         transcription_result = transcribe_audio(
@@ -115,8 +142,17 @@ async def process_video(
         )
         text = transcription_result.get("text", "")
         segments = transcription_result.get("segments", [])
-        summary = summarize_text(text, summary_length=summary_length, summary_style=summary_style)
+        summary = summarize_text(
+            text,
+            summary_length=summary_length,
+            summary_style=normalized_summary_style,
+        )
         key_points = generate_time_key_points(segments) if include_key_points_enabled else []
+        suggested_questions = generate_suggested_questions(
+            summary=summary,
+            transcript_segments=segments,
+            time_key_points=key_points,
+        )
 
         transcript_segments = [
             {
@@ -172,11 +208,33 @@ async def process_video(
         "filename": safe_name,
         "summary": summary,
         "transcription_task": normalized_task,
+        "summary_style": normalized_summary_style,
         "source_language": normalized_source_language,
         "include_key_points": include_key_points_enabled,
         "detected_language": transcription_result.get("language"),
         "transcript_text": text,
         "transcript_segments": transcript_segments,
         "time_key_points": key_points,
+        "suggested_questions": suggested_questions,
         "moderation": moderation_result,
     }
+
+
+@app.post("/ask-video")
+def ask_video_question(payload: VideoQuestionRequest):
+    try:
+        result = answer_question_from_transcript(
+            payload.question,
+            payload.transcript_text,
+            payload.transcript_segments,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to answer the video question.") from exc
+
+    for item in result.get("sources", []):
+        item["start_label"] = _format_timestamp(item["start"])
+        item["end_label"] = _format_timestamp(item["end"])
+
+    return result

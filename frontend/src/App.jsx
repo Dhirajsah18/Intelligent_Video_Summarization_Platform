@@ -6,6 +6,7 @@ import api from "./api";
 
 const processingStages = [
   { key: "uploading", label: "Uploading Video" },
+  { key: "moderating", label: "Checking Content Safety" },
   { key: "extracting", label: "Extracting Audio" },
   { key: "transcribing", label: "Transcribing Speech" },
   { key: "summarizing", label: "Generating Summary" },
@@ -26,6 +27,12 @@ export default function App() {
   const [transcriptText, setTranscriptText] = useState("");
   const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [timeKeyPoints, setTimeKeyPoints] = useState([]);
+  const [suggestedQuestions, setSuggestedQuestions] = useState([]);
+  const [questionInput, setQuestionInput] = useState("");
+  const [qaAnswer, setQaAnswer] = useState("");
+  const [qaSources, setQaSources] = useState([]);
+  const [qaError, setQaError] = useState("");
+  const [loadingQA, setLoadingQA] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [summaryLength, setSummaryLength] = useState("medium");
   const [summaryStyle, setSummaryStyle] = useState("general");
@@ -140,9 +147,12 @@ export default function App() {
   function updateProgressByPercent(nextPercent) {
     const safePercent = Math.max(0, Math.min(99, nextPercent));
     setProgressPercent(safePercent);
-    if (safePercent < 30) {
+    if (safePercent < 20) {
       setProgressStage("uploading");
       setProgressStep("Uploading video");
+    } else if (safePercent < 35) {
+      setProgressStage("moderating");
+      setProgressStep("Checking content safety");
     } else if (safePercent < 55) {
       setProgressStage("extracting");
       setProgressStep("Extracting audio");
@@ -162,7 +172,8 @@ export default function App() {
     progressIntervalRef.current = setInterval(() => {
       setProgressPercent((prev) => {
         let increment = 0.6;
-        if (prev < 30) increment = 1.4;
+        if (prev < 20) increment = 1.5;
+        else if (prev < 35) increment = 1.0;
         else if (prev < 55) increment = 1.1;
         else if (prev < 80) increment = 0.8;
         else if (prev >= 94) increment = 0;
@@ -203,6 +214,12 @@ export default function App() {
         const label = `${item.start_label || "00:00"} - ${item.end_label || "00:00"}`;
         lines.push(`${idx + 1}. [${label}] ${item.point || ""}`);
       });
+      lines.push("");
+    }
+
+    if (qaAnswer) {
+      lines.push("Interactive Q&A");
+      lines.push(qaAnswer);
       lines.push("");
     }
 
@@ -264,6 +281,9 @@ export default function App() {
             .join("\n")
         : "No key points available.";
     writeSection("Time-Based Key Points", keyPointsText);
+    if (qaAnswer) {
+      writeSection("Interactive Q&A", qaAnswer);
+    }
     writeSection("Transcript", transcriptText || "No transcript available.");
 
     doc.save(`${baseName}_summary.pdf`);
@@ -301,6 +321,15 @@ export default function App() {
     }
 
     children.push(new Paragraph(""));
+    if (qaAnswer) {
+      children.push(
+        new Paragraph({
+          children: [new TextRun({ text: "Interactive Q&A", bold: true, size: 26 })],
+        })
+      );
+      children.push(new Paragraph(qaAnswer));
+      children.push(new Paragraph(""));
+    }
     children.push(
       new Paragraph({
         children: [new TextRun({ text: "Transcript", bold: true, size: 26 })],
@@ -337,6 +366,11 @@ export default function App() {
     setTranscriptText("");
     setTranscriptSegments([]);
     setTimeKeyPoints([]);
+    setSuggestedQuestions([]);
+    setQuestionInput("");
+    setQaAnswer("");
+    setQaSources([]);
+    setQaError("");
     setProgressPercent(5);
     setProgressStage("uploading");
     setProgressStep("Uploading video");
@@ -349,7 +383,7 @@ export default function App() {
         onUploadProgress: (event) => {
           if (!event?.total) return;
           const uploadedPercent = Math.round((event.loaded * 100) / event.total);
-          const scaledPercent = Math.min(25, 5 + uploadedPercent * 0.2);
+          const scaledPercent = Math.min(18, 5 + uploadedPercent * 0.13);
           setProgressPercent((prev) => {
             const next = Math.max(prev, scaledPercent);
             updateProgressByPercent(next);
@@ -363,6 +397,7 @@ export default function App() {
       setTranscriptText(data.transcript_text || "");
       setTranscriptSegments(Array.isArray(data.transcript_segments) ? data.transcript_segments : []);
       setTimeKeyPoints(Array.isArray(data.time_key_points) ? data.time_key_points : []);
+      setSuggestedQuestions(Array.isArray(data.suggested_questions) ? data.suggested_questions : []);
       stopProgressSimulation();
       setProgressPercent(100);
       setProgressStage("summarizing");
@@ -400,6 +435,56 @@ export default function App() {
 
   async function onSummarizeClick() {
     await handleSummarizeAPI();
+  }
+
+  async function askVideoQuestion(nextQuestion) {
+    const askedQuestion = (nextQuestion ?? questionInput).trim();
+    if (!askedQuestion) {
+      setQaError("Enter a question about the video.");
+      return;
+    }
+
+    setQaError("");
+    setQaAnswer("");
+    setQaSources([]);
+    setLoadingQA(true);
+
+    try {
+      const res = await api.post("/ask-video", {
+        question: askedQuestion,
+        transcript_text: transcriptText,
+        transcript_segments: transcriptSegments,
+      });
+
+      const data = res.data || {};
+      setQuestionInput(askedQuestion);
+      setQaAnswer(data.answer || "");
+      setQaSources(Array.isArray(data.sources) ? data.sources : []);
+    } catch (e) {
+      const backendDetail = e?.response?.data?.detail;
+      setQaError(
+        typeof backendDetail === "string" && backendDetail.trim()
+          ? backendDetail
+          : "Could not answer that question from the transcript."
+      );
+    } finally {
+      setLoadingQA(false);
+    }
+  }
+
+  function seekVideoTo(seconds) {
+    const video = videoPlayerRef.current;
+    const time = Number(seconds);
+
+    if (!video || !Number.isFinite(time)) {
+      return;
+    }
+
+    const hasDuration = Number.isFinite(video.duration) && video.duration > 0;
+    const safeTime = hasDuration ? Math.min(Math.max(0, time), Math.max(0, video.duration - 0.25)) : Math.max(0, time);
+
+    video.currentTime = safeTime;
+    video.play().catch(() => {});
   }
 
   return (
@@ -669,11 +754,111 @@ export default function App() {
                       className="space-y-4 custom-scrollbar"
                       style={{ maxHeight: 260, overflowY: "auto" }}
                     >
-                      <p className="text-slate-600 leading-relaxed">
+                      <p className="text-slate-600 leading-relaxed whitespace-pre-line">
                         {summaryHTML ||
                           "Your paragraph summary will appear here. It will be a concise overview of the video's content."}
                       </p>
                     </div>
+
+                    {summaryHTML && (
+                      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 md:p-5">
+                        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                          <div>
+                            <h3 className="text-lg font-semibold text-slate-800" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
+                              Ask About This Video
+                            </h3>
+                            <p className="text-sm text-slate-600">
+                              Would you like to know more about this topic?
+                            </p>
+                          </div>
+                          <p className="text-xs font-medium text-slate-500">
+                            Fixed answer length: 100-150 words
+                          </p>
+                        </div>
+
+                        {suggestedQuestions.length > 0 && (
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {suggestedQuestions.map((question) => (
+                              <button
+                                key={question}
+                                type="button"
+                                onClick={() => askVideoQuestion(question)}
+                                className="rounded-full border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:border-amber-400 hover:bg-amber-50 hover:text-slate-900"
+                              >
+                                {question}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="mt-4 flex flex-col gap-3 md:flex-row">
+                          <input
+                            type="text"
+                            value={questionInput}
+                            onChange={(e) => setQuestionInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                askVideoQuestion();
+                              }
+                            }}
+                            placeholder="Ask something based on the transcript"
+                            className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-800 outline-none focus:border-amber-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => askVideoQuestion()}
+                            disabled={loadingQA || !transcriptSegments.length}
+                            className="rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white hover:bg-amber-500 hover:text-slate-950 disabled:cursor-not-allowed disabled:bg-slate-400"
+                          >
+                            {loadingQA ? "Thinking..." : "Ask"}
+                          </button>
+                        </div>
+
+                        {qaError && (
+                          <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                            {qaError}
+                          </div>
+                        )}
+
+                        {qaAnswer && (
+                          <div className="mt-4 space-y-4">
+                            <div className="rounded-xl border border-amber-200 bg-white p-4">
+                              <p className="text-xs font-semibold uppercase tracking-wide text-amber-700">
+                                Answer
+                              </p>
+                              <p className="mt-2 text-sm leading-7 text-slate-700 whitespace-pre-line">
+                                {qaAnswer}
+                              </p>
+                            </div>
+
+                            {qaSources.length > 0 && (
+                              <div>
+                                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                  Transcript Sources
+                                </p>
+                                <div className="space-y-2">
+                                  {qaSources.map((source, idx) => (
+                                    <div key={`${source.start}-${idx}`} className="rounded-xl border border-slate-200 bg-white p-3">
+                                      <button
+                                        type="button"
+                                        onClick={() => seekVideoTo(source.start)}
+                                        className="rounded border border-slate-200 bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600 hover:bg-slate-200"
+                                      >
+                                        {source.start_label || "00:00"} - {source.end_label || "00:00"}
+                                      </button>
+                                      <p className="mt-2 text-sm text-slate-600">
+                                        {source.text}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {includeKeyPoints && (
                       <div>
@@ -685,7 +870,14 @@ export default function App() {
                             timeKeyPoints.map((item, idx) => (
                               <div key={`${item.start}-${idx}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
                                 <p className="text-xs font-semibold text-amber-700 mb-1">
-                                  {item.start_label || "00:00"} - {item.end_label || "00:00"}
+                                  <button
+                                    type="button"
+                                    onClick={() => seekVideoTo(item.start)}
+                                    className="rounded border border-amber-200 bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 hover:bg-amber-200"
+                                    title="Jump video to this point"
+                                  >
+                                    {item.start_label || "00:00"} - {item.end_label || "00:00"}
+                                  </button>
                                 </p>
                                 <p className="text-sm text-slate-700">{item.point}</p>
                               </div>
@@ -705,9 +897,14 @@ export default function App() {
                         {transcriptSegments.length > 0 ? (
                           transcriptSegments.map((segment, idx) => (
                             <div key={`${segment.start}-${idx}`} className="rounded-lg border border-slate-200 bg-white p-3">
-                              <p className="text-xs font-semibold text-slate-500 mb-1">
+                              <button
+                                type="button"
+                                onClick={() => seekVideoTo(segment.start)}
+                                className="mb-1 rounded border border-slate-200 bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600 hover:bg-slate-200"
+                                title="Jump video to this timestamp"
+                              >
                                 {segment.start_label || "00:00"} - {segment.end_label || "00:00"}
-                              </p>
+                              </button>
                               <p className="text-sm text-slate-700">{segment.text}</p>
                             </div>
                           ))

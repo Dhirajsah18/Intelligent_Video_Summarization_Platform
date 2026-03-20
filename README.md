@@ -87,9 +87,9 @@ cd AI-video_summarizer
 ```bash
 cd backend
 python -m venv venv
-source : venv\Scripts\activate   # Windows
+venv\Scripts\activate            # Windows (PowerShell/CMD)
 pip install -r requirements.txt
-uvicorn main:app --reload
+python -m uvicorn main:app --reload
 
 ```
 ### 3. Frontend Setup
